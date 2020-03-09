@@ -2,6 +2,7 @@ package cmq.rpc;
 
 import cmq.util.ByteUtil;
 import cmq.util.SerializingUtil;
+import org.apache.log4j.Logger;
 
 import javax.net.SocketFactory;
 import java.io.IOException;
@@ -10,6 +11,8 @@ import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.rmi.RemoteException;
 import java.util.Hashtable;
@@ -35,6 +38,7 @@ public class Client {
     private AtomicBoolean running = new AtomicBoolean(true); // if client runs
     private int counter;
     private SocketFactory socketFactory;           // how to create sockets
+    Logger logger = Logger.getLogger(Client.class);
 
 
     private Connection getConnection(ConnectionId remoteId,
@@ -58,13 +62,16 @@ public class Client {
                     connections.put(remoteId, connection);
                 }
             }
+
             addFlag = connection.addCall(call);
+
         } while (!addFlag);
 
         //we don't invoke the method below inside "synchronized (connections)"
         //block above. The reason for that is if the server happens to be slow,
         //it will take longer to establish a connection and that will slow the
         //entire system down.
+        logger.debug("准备建立连接");
         connection.setupIOstreams();
         return connection;
     }
@@ -78,11 +85,13 @@ public class Client {
         Call call = new Call(message);
 
         Connection connection = getConnection(remoteId, call); // 将call和connecttion绑定，并把connection放到hashMap里
+        logger.debug("准备发送数据");
         connection.sendParam(call);                 // send the parameter
 
         boolean interrupted = false;
         synchronized (call) {
             while (!call.done) {
+
                 try {
                     call.wait();             // call被锁定后，call的值无法更新，所以在这里阻塞，释放call的锁
                 } catch (InterruptedException ie) {
@@ -141,14 +150,15 @@ public class Client {
      */
     private class Connection extends Thread {
         private InetSocketAddress server;             // server ip:port
-        private final ConnectionId remoteId;                // connection id
-        SocketChannel socketChannel;
+        private final ConnectionId remoteId;
+        private Selector selector;
+        private SocketChannel socketChannel;
         private int retryTime = 0;
 
 
         // 可能一个客户端的多个线程同时使用一个连接，发送多个任务，但是根据任务处理的速度不同，有的先返回，有的后返回
         // 所以要区分任务是哪个，从而把结果返回给相应的客户端调用线程
-        private Hashtable<Integer, Call> calls = new Hashtable<Integer, Call>();
+        private final Hashtable<Integer, Call> calls = new Hashtable<Integer, Call>();
 
 
         // 设置一个定时器，时间到后主动关闭连接。
@@ -158,6 +168,7 @@ public class Client {
         public Connection(ConnectionId remoteId) throws IOException {
             this.remoteId = remoteId;
             this.server = remoteId.getAddress();
+
             if (server.isUnresolved()) {
                 throw new UnknownHostException("unknown host: " +
                         remoteId.getAddress().getHostName());
@@ -180,7 +191,9 @@ public class Client {
         private synchronized boolean addCall(Call call) {
             if (shouldCloseConnection.get())
                 return false;
+            logger.debug("添加call进入calls");
             calls.put(call.id, call);
+            logger.debug("添加call成功");
             notify();
             return true;
         }
@@ -191,18 +204,26 @@ public class Client {
          * 如果连接已经建立，直接返回
          * 否则重新建立连接
          */
-        private synchronized void setupIOstreams() throws InterruptedException {
-            if (socketChannel != null || shouldCloseConnection.get()) {
+        private synchronized void setupIOstreams() throws InterruptedException, ClosedChannelException {
+            if (shouldCloseConnection.get()) {
                 return;
             }
+
+            if (socketChannel != null) {
+                return;
+            }
+
             try {
 
                 while (true) {
                     // 每个Connection在初始化的时候拥有远程的地址和端口号
+                    logger.debug("准备建立连接");
                     setupConnection();// 建立连接
+                    logger.debug("建立连接");
 
                     //  建立连接后就可以启动本线程，监听有没有call
-
+                    //  需要注意的是上面如果socketchannel如果不为空就返回了，所以连接线程是一次启动永久使用
+                    //  所以在run方法里，如果socket关闭了，线程就要结束，同时要把socket置为null,不然就会启动两个线程同时运行
                     start();
                     return;
                 }
@@ -239,9 +260,11 @@ public class Client {
         private synchronized void setupConnection() throws IOException, InterruptedException {
             while (true) {
                 try {
+
                     InetSocketAddress address = this.remoteId.address;
                     this.socketChannel = SocketChannel.open(address);
-                    // 能执行到这里说明连接正常
+                    this.socketChannel.configureBlocking(false);
+
                     return;
                 } catch (Exception e) {
                     retryTime++;
@@ -285,23 +308,13 @@ public class Client {
         public void run() {
 
             //如果连接没有置为关闭状态，就继续接受，否则就打开
-            //waitForWork()里面有个定时器，如果超时就将连接状态转为关闭，然后跳出循环后主动关闭
-            while (!shouldCloseConnection.get()) {
+            // 如果接收数据出现异常就要关闭线程
+            while (waitForWork()) {
                 // 没有请求就不会有数据
-                while (calls.isEmpty()) {
-                    try {
-                        Thread.sleep(100);
-
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-
                 receiveResponse();
             }
-
-            // waitForWork()被改写，始终返回true,所以下面的语句不会被调用
             close();
+
         }
 
 
@@ -314,20 +327,23 @@ public class Client {
                 return;
             }
             try {
-                synchronized (this.socketChannel) { //每次发数据的时候要先发头，后发内容，这是一个原子操作
 
-                    // 先将要发送的数据组成一个message
-                    byte[] messageArr = SerializingUtil.serialize(call.message);
+                // 先将要发送的数据组成一个message
+                byte[] messageArr = SerializingUtil.serialize(call.message);
 
-                    // 先把待发送的数据的长度转为字节数组，整形数据占两个字节，够用了
-                    byte[] lenByte = ByteUtil.toByteArray(messageArr.length, 2);
-                    ByteBuffer lenBuffer = ByteBuffer.wrap(lenByte);
-                    socketChannel.write(lenBuffer);
+                // 先把待发送的数据的长度转为字节数组，整形数据占两个字节，够用了
+                byte[] lenByte = ByteUtil.toByteArray(messageArr.length, 2);
+                ByteBuffer lenBuffer = ByteBuffer.wrap(lenByte);
 
-                    // 然后发送真实数据
-                    ByteBuffer data = ByteBuffer.wrap(messageArr);
-                    socketChannel.write(data);
-                }
+                // 然后发送真实数据
+                ByteBuffer data = ByteBuffer.wrap(messageArr);
+
+
+                // 两次写入时间间隔要短
+                logger.debug("发送数据...");
+                socketChannel.write(lenBuffer);
+                socketChannel.write(data);
+                logger.debug("发送数据成功");
             } catch (IOException e) {
                 markClosed(e);
             }
@@ -340,36 +356,32 @@ public class Client {
             if (shouldCloseConnection.get()) {
                 return;
             }
+
+            logger.debug("开始读取数据...");
+
             try {
                 ByteBuffer lenBuffer = ByteBuffer.allocate(2);
-                int dateLen = 0;
 
-                // 原代码用的是io流，读不到会阻塞，这里用了取巧的方法，读不到就循环
-                // 下一步可以考虑用selector
-                while (true) {
-                    socketChannel.read(lenBuffer);
-                    lenBuffer.flip();
-                    dateLen = ByteUtil.toInt(lenBuffer.array());
-                    if (dateLen != 0) {
-                        break;
-                    }
-                    try {
-                        wait(100);
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    }
+                while (this.socketChannel.read(lenBuffer) <= 0) {
 
                 }
 
+                lenBuffer.flip();
+                int dateLen = ByteUtil.toInt(lenBuffer.array());
+
                 // 然后读取内容
                 ByteBuffer data = ByteBuffer.allocate(dateLen);
-                socketChannel.read(data);
+                while (this.socketChannel.read(data) == 0) {
+                    logger.debug("等待数据写入");
+                }
                 data.flip();
                 Message message = SerializingUtil.deserialize(data.array(), Message.class);
-
-
+                if (message != null) {
+                    logger.debug("数据读取成功" + message);
+                }
                 // 拿到对应的Call
                 Call call = calls.get(message.id);
+                logger.debug("获取call..");
 
                 if (message.status == Status.SUCCESS) {
                     // 客户端发送请求后，就一直判断call的状态，所以如果有返回值，就修改call的状态，这样用户就能拿到结果了
@@ -382,7 +394,6 @@ public class Client {
             } catch (IOException e) {
                 markClosed(e);
             }
-
         }
 
         private synchronized void markClosed(IOException e) {

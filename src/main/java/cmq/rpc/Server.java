@@ -2,6 +2,7 @@ package cmq.rpc;
 
 import cmq.util.ByteUtil;
 import cmq.util.SerializingUtil;
+import org.apache.log4j.Logger;
 
 import java.io.IOException;
 import java.io.Serializable;
@@ -42,7 +43,7 @@ public class Server implements Serializable {
     private int maxQueueSize;
     private Boolean isRunning = true;
     private Object instance;  // handle执行任务的时候要用其调用函数
-
+    Logger logger = Logger.getLogger(Server.class);
 
     public Server(Object instance, int port, String address) throws IOException {
         this.instance = instance;
@@ -57,13 +58,15 @@ public class Server implements Serializable {
 
 
     public void start() {
+        logger.info("start listener ...");
         this.listener.start();
+        logger.info("start handlers ...");
         this.handlers = new Handler[handlerCount];
         for (int i = 0; i < handlerCount; i++) {
             handlers[i] = new Handler(i);
             handlers[i].start();
         }
-        // responder
+//         responder
     }
 
     public Object call(Call call) throws IOException {
@@ -92,7 +95,7 @@ public class Server implements Serializable {
             }
         } catch (Throwable e) {
             if (!(e instanceof IOException)) {
-                System.out.println("Unexpected throwable object " + e);
+                logger.error("Unexpected throwable object " + e);
             }
             IOException ioe = new IOException(e.toString());
             ioe.setStackTrace(e.getStackTrace());
@@ -159,23 +162,7 @@ public class Server implements Serializable {
         }
 
         private synchronized void close() throws IOException {
-
-            if (!channel.isOpen())
-                return;
-            try {
-                socket.shutdownOutput();
-            } catch (Exception e) {
-            }
-            if (channel.isOpen()) {
-                try {
-                    channel.close();
-                } catch (Exception e) {
-                }
-            }
-            try {
-                socket.close();
-            } catch (Exception e) {
-            }
+            socket.close();
         }
 
     }
@@ -213,6 +200,8 @@ public class Server implements Serializable {
                         try {
                             // selector 一开始创建的时候并没有注册任何channel,所以每次执行到这里是必定要阻塞的，必须唤醒才能继续执行
                             // 正常来件，不唤醒也能继续执行，但是现在外面加锁了，不唤醒无法执行到下面去让出锁，就是死锁状态
+
+                            logger.debug("Reader 等待被唤醒...");
                             readerSelector.select();
 
                             // 下面是为了让出锁，这样channel才能添加进来，可以主动唤醒，不然时间到了自己也会醒
@@ -228,9 +217,12 @@ public class Server implements Serializable {
 
                                 if (key.isValid()) {
                                     if (key.isReadable()) {
+                                        logger.debug("Reader获取一个读取事件");
                                         doRead(key);
+                                        logger.debug("Reader的读取事件处理完毕");
                                     }
                                 }
+
                                 key = null;
                             }
                         } catch (Exception e) {
@@ -302,6 +294,7 @@ public class Server implements Serializable {
         public void run() {
             while (isRunning) {
                 try {
+                    logger.debug("监听器开始等待下一个连接...");
                     acceptSelector.select();
                     Iterator<SelectionKey> iterator = acceptSelector.selectedKeys().iterator();
 
@@ -349,8 +342,9 @@ public class Server implements Serializable {
                  * 第三步，注册，并让出锁
                  */
 
-                reader.startAdd();
+                logger.debug("监听器获取一个有效连接，正在把连接注册到Reader的选择器上...");
 
+                reader.startAdd();
                 SelectionKey readerKey = reader.registerChannel(channel);
 
                 // 绑定一个连接，便于后面读取数据
@@ -369,35 +363,69 @@ public class Server implements Serializable {
          */
         private void doRead(SelectionKey key) {
 
-            Connection connection = (Connection) key.attachment();
-            SocketChannel socketChannel = (SocketChannel) key.channel();
 
+            Connection connection = (Connection) key.attachment();
+            SocketChannel socketChannel = connection.channel;
+            logger.debug("Reader开始读取数据");
 
             try {
+
+                Message message = null;
+
                 // 先读取对象的长度
                 ByteBuffer lenBuffer = ByteBuffer.allocate(2);
-                socketChannel.read(lenBuffer);
+                int messageHead = socketChannel.read(lenBuffer);
+
+
+                // 一旦服务端断开连接,客户端会产生一个read请求，但是读取不到任何数据，返回-1
+                // 必须从key里获得channel数据才算处理，否则不算
+                if (messageHead < 0) {
+                    key.channel().close();
+                    return;
+                }
+
                 lenBuffer.flip();
                 int dateLen = ByteUtil.toInt(lenBuffer.array());
 
-                // 然后读取内容
-                ByteBuffer data = ByteBuffer.allocate(dateLen);
-                socketChannel.read(data);
-                data.flip();
-                Message message = SerializingUtil.deserialize(data.array(), Message.class);
+                logger.debug("数据长度 " + dateLen);
 
+                // 然后读取内容
+                logger.debug("开始读取内容...");
+                ByteBuffer data = ByteBuffer.allocate(dateLen);
+
+                while (socketChannel.read(data) == 0) {
+                    logger.debug("等待数据导入");
+                }
+
+                data.flip();
+
+                message = SerializingUtil.deserialize(data.array(), Message.class);
+
+                logger.debug("message " + message);
 
                 Class<?> protocolClass = Class.forName(message.getProtocolName());
 
                 connection.setProtocol(protocolClass);
 
                 Call call = new Call(message, connection);
+
+                logger.debug("Read 已经读取到客户端请求，发送至阻塞队列供handle处理");
                 callQueue.put(call);
 
             } catch (Exception e) {
-                //   e.printStackTrace();
                 // 当客户端断开连接后，仍然会发一个读请求，但是已经无法读到数据，在捕获到异常的时候要把key取消
-                key.cancel();
+                e.printStackTrace();
+                if (e instanceof IOException) {
+                    logger.debug("数据读取异常");
+                }
+                if (e instanceof NullPointerException) {
+                    logger.debug("客户端主动断开连接！！！" + e);
+                }
+                try {
+                    key.channel().close();
+                } catch (Exception eN) {
+
+                }
             }
         }
 
@@ -425,6 +453,8 @@ public class Server implements Serializable {
                 try {
                     final Call call = callQueue.take(); // pop the queue; maybe blocked here
 
+                    logger.debug("handle 取得客户端请求事件，正在处理..");
+
                     Exception error = null;
                     Object value = null;
 
@@ -437,28 +467,31 @@ public class Server implements Serializable {
 
                     call.setmessgeResponse(value, error == null ? Status.SUCCESS : Status.ERROR);
 
-                    System.out.println(call);
                     // 直接发送
                     SocketChannel socketChannel = call.connection.channel;
 
-
+                    logger.debug("handle 发送处理结果到服务端,处理结果为" + call.message.getMethodName() + ": " + value);
                     // 防止数据交叉发送引起数据错位，所以如果使用通道发送数据就要上锁
-                    synchronized (socketChannel) {
+                    synchronized (call.connection.channel) {
                         try {
+
                             byte[] messageArr = SerializingUtil.serialize(call.message);
 
                             // 先把待发送的数据的长度转为字节数组，整形数据占两个字节，够用了
                             byte[] lenByte = ByteUtil.toByteArray(messageArr.length, 2);
                             ByteBuffer lenBuffer = ByteBuffer.wrap(lenByte);
-                            socketChannel.write(lenBuffer);
 
-                            // 然后发送真实数据
                             ByteBuffer data = ByteBuffer.wrap(messageArr);
+
+
+                            // 两次写入时间间隔要短
+                            logger.debug("handle 正在发送数据：" + call.message);
+                            socketChannel.write(lenBuffer);
                             socketChannel.write(data);
+                            logger.debug("handle 正在发送数据成功！！！");
                         } catch (IOException e) {
                             e.printStackTrace();
                         }
-
                     }
 
                     // 把执行的结果放到队列交给response去处理
